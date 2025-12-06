@@ -146,12 +146,15 @@ CREATE TABLE return_requests (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     CONSTRAINT return_requests_notes_length CHECK (notes IS NULL OR char_length(notes) <= 500),
     CONSTRAINT return_requests_condition_required CHECK (
-        (condition IS NULL AND status = 'pending') OR 
+        (condition IS NULL AND status = 'pending') OR
         (condition IS NOT NULL AND status = 'confirmed')
-    ),
-    CONSTRAINT return_requests_one_pending_per_borrow UNIQUE (borrow_request_id, status) 
-        WHERE status = 'pending'
+    )
 );
+
+-- Partial unique index to ensure only one pending return request per borrow
+CREATE UNIQUE INDEX idx_return_requests_one_pending_per_borrow
+    ON return_requests(borrow_request_id)
+    WHERE status = 'pending';
 
 COMMENT ON TABLE return_requests IS 'Return requests for borrowed books';
 COMMENT ON COLUMN return_requests.condition IS 'Book condition: normal (bình thường), damaged (hư hỏng), lost (mất)';
@@ -375,15 +378,37 @@ CREATE POLICY "Users can read own profile"
     ON users FOR SELECT
     USING (auth.uid() = id);
 
--- Users can update their own profile (except role and status)
+-- Users can update their own profile (role and status changes are prevented by trigger)
 CREATE POLICY "Users can update own profile"
     ON users FOR UPDATE
     USING (auth.uid() = id)
-    WITH CHECK (
-        auth.uid() = id AND
-        role = OLD.role AND
-        status = OLD.status
-    );
+    WITH CHECK (auth.uid() = id);
+
+-- Trigger to prevent users from changing their own role and status
+CREATE OR REPLACE FUNCTION prevent_self_role_status_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Allow admins and librarians to change role/status
+    IF EXISTS (
+        SELECT 1 FROM users
+        WHERE id = auth.uid() AND role IN ('admin', 'librarian') AND status = 'active'
+    ) THEN
+        RETURN NEW;
+    END IF;
+
+    -- For regular users updating their own profile, preserve role and status
+    IF NEW.id = auth.uid() THEN
+        NEW.role = OLD.role;
+        NEW.status = OLD.status;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER prevent_self_role_status_change_trigger
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION prevent_self_role_status_change();
 
 -- Admins can read all users
 CREATE POLICY "Admins can read all users"
@@ -552,14 +577,37 @@ CREATE POLICY "Users can read own fines"
     ON fines FOR SELECT
     USING (user_id = auth.uid());
 
--- Users can update their own fines (mark as paid - pending confirmation)
+-- Users can update their own fines (only unpaid fines, status change validated by trigger)
 CREATE POLICY "Users can update own fines to pending"
     ON fines FOR UPDATE
-    USING (user_id = auth.uid())
-    WITH CHECK (
-        user_id = auth.uid() AND
-        (OLD.status = 'unpaid' AND NEW.status = 'pending_confirmation')
-    );
+    USING (user_id = auth.uid() AND status = 'unpaid')
+    WITH CHECK (user_id = auth.uid() AND status = 'pending_confirmation');
+
+-- Trigger to validate fine status transitions for users
+CREATE OR REPLACE FUNCTION validate_fine_status_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Allow librarians and admins to make any status change
+    IF EXISTS (
+        SELECT 1 FROM users
+        WHERE id = auth.uid() AND role IN ('librarian', 'admin') AND status = 'active'
+    ) THEN
+        RETURN NEW;
+    END IF;
+
+    -- For regular users, only allow: unpaid -> pending_confirmation
+    IF OLD.status = 'unpaid' AND NEW.status = 'pending_confirmation' THEN
+        RETURN NEW;
+    END IF;
+
+    -- Reject any other status change by regular users
+    RAISE EXCEPTION 'Users can only change fine status from unpaid to pending_confirmation';
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER validate_fine_status_change_trigger
+    BEFORE UPDATE ON fines
+    FOR EACH ROW EXECUTE FUNCTION validate_fine_status_change();
 
 -- Librarians and admins can read all fines
 CREATE POLICY "Librarians and admins can read all fines"
